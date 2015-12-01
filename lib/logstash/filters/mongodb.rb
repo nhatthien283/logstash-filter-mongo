@@ -1,6 +1,7 @@
 # encoding: utf-8
 require "logstash/filters/base"
 require "logstash/namespace"
+require "mongo"
 
 # This example filter will replace the contents of the default 
 # message field with whatever you specify in the configuration.
@@ -19,13 +20,27 @@ class LogStash::Filters::Mongodb < LogStash::Filters::Base
   #
   config_name "mongodb"
   
+  config :uri, :validate => :string, :required => true
+
+   # The database to use
+  config :database, :validate => :string, :required => true
+
+  # The collection to use. This value can use `%{foo}` values to dynamically
+  # select a collection based on data in the event.
+  config :collection, :validate => :string, :required => true
+
+  # Number of seconds to wait after failure before retrying
+  config :retry_delay, :validate => :number, :default => 3, :required => false
+
   # Replace the message with this value.
   config :message, :validate => :string, :default => "Hello World!"
   
 
   public
   def register
-    # Add instance variables 
+    Mongo::Logger.logger = @logger
+    conn = Mongo::Client.new(@uri)
+    @db = conn.use(@database)
   end # def register
 
   public
