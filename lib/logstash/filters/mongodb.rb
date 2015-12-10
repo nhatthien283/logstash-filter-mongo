@@ -35,69 +35,115 @@ class LogStash::Filters::Mongodb < LogStash::Filters::Base
   # Replace the message with this value.
   config :message, :validate => :string, :default => "Hello World!"
 
+  # Datafield to check action
+  config :dataField, :validate => :string, :default => "action", :required => true
+
+  # Debug
+  config :debug, :validate => :boolean, :default => false
+
   public
   def register
     Mongo::Logger.logger = @logger
     conn = Mongo::Client.new(@uri)
     @db = conn.use(@database)
-    @logger = Logger.new(STDOUT)
+    
+    if @debug 
+      @logger = Logger.new(STDOUT)
+    end
+
     @logger.info("> Do register method: db: #{@database}.#{@collection}")
 
-    prepareMeta()
+    prepareMeta2()
   end # def register
 
   public
   def filter(event)
     begin
-	# append fields
-	@apDict['ALL'].each do |col,fields|
-		data = @db[col].find(:_id => event['memid']).limit(1).first()
-		unless data.nil?
-			fields.each do |field|
-				tmp = field.split(":")
-				event[tmp[1]] = data[tmp[0]]
-			end
-			@logger.info("Info found!")
-		else
-			@logger.info("NIL: not found user info")
-		end
-	end
+      @CDMeta.each do |col, info|
+        _last = @db[col].find(:_id => event['memid']).limit(1).first()
+        _current = _last.clone() if not(_last.nil?)
 
-	# update field
-	@upDict['ALL'].each do |col,uInfos|
-		uHash = Hash.new()
-		@logger.info(uInfos)
-		uInfos.each do |info|
-			tmp = info.split(":")
-			field = tmp[0]
-			method = tmp[1]
-			val = tmp[2]
-			if (method == 'inc')
-				if (uHash.has_key?('$inc'))
-					uHash['$inc'].push({field=>val})
-				else
-					uHash['$inc'] = [{field=>val}]
-				end
-			elsif method == 'set'
-                                if (uHash.has_key?('$set'))
-                                        uHash['$set'].push({field=>val})
-                                else
-                                        uHash['$set'] = [{field=>val}]
-				end
+        @logger.info("CD info: #{info}")
 
-			end
-		end
-		@logger.info(uHash)
-		@db[col].update({"_id" => event['memid']}, uHash)
-	end	
+        #Update for all action
+        info[:update]['ALL'].each do |uInfo|
+          tmp = uInfo.split(":")
+          f = tmp[0]
+          method = tmp[1].downcase
+          val = event.sprintf(tmp[2])
 
-	
-	#d = @db[@collection].find().limit(1).first()
+          if "inc".eql?(method) && not(_last.nil?)
+            _current[f] = _last[f].to_i + val.to_i
+          elsif "setint".eql?(method) && not(_last.nil?)
+            _current[f] = val.to_i
+          elsif "setstr".eql?(method) && not(_last.nil?)
+            _current[f] = val.to_s
+          elsif "cre".eql?(method)
+            @db[col].insert_one({"_id" => val, "createdAt" => DateTime.parse(event['@timestamp'].to_s)})
+          end
+        end
+
+        #Update for specific action
+        @logger.info("check key: #{event[@dataField]}")
+        if info[:update].has_key?(event[@dataField])
+          info[:update][event[@dataField]].each do |uInfo|
+            tmp = uInfo.split(":")
+            f = tmp[0]
+            method = tmp[1].downcase
+            val = event.sprintf(tmp[2])
+
+            if "inc".eql?(method) && not(_last.nil?)
+              @logger.info("> INC: #{f}")
+              _current[f] = _last[f].to_i + val.to_i
+            elsif "setint".eql?(method) && not(_last.nil?)
+              _current[f] = val.to_i
+            elsif "setstr".eql?(method) && not(_last.nil?)
+              _current[f] = val.to_s
+            elsif "cre".eql?(method)
+              _last = {"_id" => val, "createdAt" => DateTime.parse(event['@timestamp'].to_s)}
+              _current = _last.clone() 
+              @db[col].insert_one(_current)
+              @logger.info("> INSERT _last: #{_last}" )
+              @logger.info("> INSERT _current: #{_current}" )
+            end
+          end
+        end
+
+        #Append for all action
+        unless _last.nil?
+          info[:append]['ALL'].each do |aInfo|
+            tmp = aInfo.split(":")
+            f = tmp[0]
+            exF = tmp[1]
+            code = tmp[2..-1].join(":")
+            @logger.info("code: #{code}")
+            if (code.length == 0)
+              @logger.info(">> Normal set")
+              event[exF] = _current[f]
+            else
+              begin
+                @logger.info(">> eval code")
+                event[exF] = eval(code)
+              rescue Exception => ex
+                @logger.info("EVALUATION CODE FAIL!")
+              end
+            end
+
+          end
+        end
+
+
+        if not(_last.nil?) && not(_current.nil?)
+          @logger.info("_current: #{_current}")
+          @logger.info("_last: #{_last}")
+          @db[col].update_one({"_id"=>event['memid']}, _current)
+        end
+      end
     rescue Mongo::Error::NoServerAvailable => ex
-	@logger.info("No server is available.")
-	sleep @retry_delay
-	@db = Mongo::Client.new(@uri).use(@database)
-	retry
+      @logger.info("No server is available.")
+      sleep @retry_delay
+      @db = Mongo::Client.new(@uri).use(@database)
+      retry
     end
 
     # filter_matched should go in the last line of our successful code
@@ -105,44 +151,59 @@ class LogStash::Filters::Mongodb < LogStash::Filters::Base
   end # def filter
 
   public
-  def prepareMeta()
-        @apDict = Hash.new()
-	@upDict = Hash.new()	
+  def prepareMeta2()
+    @CDMeta = Hash.new()
 
-	#apDict format:  {:ALL=>{"UserInfo"=>["level:lv", "session:s"]}}
-	@apDict['ALL'] = Hash.new()
-	
-	#upDict format {"levelup"=>{"UserInfo"=>["level:inc:1.0"]}, "login"=>{"UserInfo"=>["session:inc:1.0"]}, "ALL"=>{"UserInfo"=>["step:inc:1.0"]}}
-	
+    @CDs = @db[@collection].find()
+    @CDs.each do |doc|
+      tmp = doc[:src].split(':')
+      col = tmp[0]
+      f = tmp[1]
+      exF = doc[:exName]
+      @logger.info("pre update Dict: #{@CDMeta}")
+      #append process metadata
+      unless "none".eql? doc[:scope].downcase
+        if "user".eql? doc[:scope]
+          if not @CDMeta.has_key?(col)
+            @CDMeta[col] = Hash.new()
+          end
 
-        @CDs = @db[@collection].find()
-        @CDs.each do |doc|
-                tmp = doc[:src].split(':')
-		col = tmp[0]
-                f = tmp[1]
-		exF = doc[:exName]
-                if (@apDict['ALL'].has_key?(col))
-                        @apDict['ALL'][col].push("#{f}:#{exF}")
-		else
-			@apDict['ALL'][col] = ["#{f}:#{exF}"]
-                end
+          if not @CDMeta[col].has_key?(:append)
+            @CDMeta[col][:append] = Hash.new()
+          end
 
-		doc['updateActions'].each do |act,upInfo|
-			if (@upDict.has_key?(act))
-				if (@upDict[act].has_key?(col))	
-					@upDict[act][col].push("#{f}:#{upInfo['formular']}:#{upInfo['val']}")
-				else
-					@upDict[act][col] = ["#{f}:#{upInfo['formular']}:#{upInfo['val']}"]
-				end
-			else
-				@upDict[act] = Hash.new()
-				@upDict[act][col] = ["#{f}:#{upInfo['formular']}:#{upInfo['val']}"]
-			end
-		end
+          if not @CDMeta[col][:append].has_key?('ALL')
+            @CDMeta[col][:append]['ALL'] = Array.new()
+          end
+
+          @CDMeta[col][:append]['ALL'].push("#{f}:#{exF}:#{doc['appendCode']}")
         end
-	@logger.info(@apDict)
-	@logger.info(@upDict)
-  end
+      end
 
+      #update process metadata
+      doc['updateActions'].each do |act,upInfo|
+        if not @CDMeta.has_key?(col)
+          @CDMeta[col] = Hash.new()
+        end
+
+        if not @CDMeta[col].has_key?(:update)
+          @CDMeta[col][:update] = Hash.new()
+        end
+
+        if not @CDMeta[col][:update].has_key?(act)
+          @CDMeta[col][:update][act] = Array.new()
+        end
+
+        @CDMeta[col][:update][act].push("#{f}:#{upInfo['formular']}:#{upInfo['val']}")
+      end
+    end
+
+    @logger.info("update Dict: #{@CDMeta}")
+  end # prepare data 2
+
+  public
+  def collectInfo(key, event)
+
+  end
 
 end # class LogStash::Filters::Example
